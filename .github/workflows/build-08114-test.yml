@@ -1,0 +1,118 @@
+name: Build CallBar 0.81.14 Blur Fix — Temporary Runner
+
+on:
+  push:
+    branches: [temporary-test-08114-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout exactly the 0.81.14 test source from public CallBar source repository
+        uses: actions/checkout@v4
+        with:
+          repository: 551UK/CallBar-IOS16-Private
+          ref: 43f1131349d2fc298be9ad4d1949c9fa709606ec
+          path: src
+
+      - name: Verify source and unchanged 0.81.10 calling logic
+        run: |
+          set -euo pipefail
+          cd src
+          test "$(git rev-parse HEAD)" = "43f1131349d2fc298be9ad4d1949c9fa709606ec"
+          grep -qx 'Version: 0.0.81.14' <(grep '^Version: ' control)
+          grep -q 'static BOOL CBNHideTelephoneProxyBackdrop(void)' Tweak.xm
+          grep -q 'CBCallIsTelephoneProvider(call)' Tweak.xm
+          grep -q 'CBNCallBarObservedScreenshot' Tweak.xm
+          grep -q 'const CGFloat buttonDrop = 5.0;' CBCallBarView.m
+          git diff --exit-code 7641d8595874a9170b6339b241c55d2b195a37f8 HEAD -- . ':!Tweak.xm' ':!control' ':!.github/workflows/**'
+          echo 'PASS: only native telephone blur fix differs from confirmed 0.81.10'
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install build tools
+        run: brew install make dpkg xz ldid-procursus
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      - name: Install patched iOS 16.5 SDK
+        run: |
+          set -euo pipefail
+          sdk_tmp="$(mktemp -d)"
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks "$sdk_tmp/sdks"
+          cd "$sdk_tmp/sdks"
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mkdir -p "$THEOS/sdks"
+          mv iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Compile iOS 16 Dopamine rootless tweak
+        run: |
+          set -euo pipefail
+          cd src
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm layout/DEBIAN/postrm
+          gmake clean package FINALPACKAGE=1
+
+      - name: Verify 0.81.14 DEB, architecture and contents
+        run: |
+          set -euo pipefail
+          cd src
+          deb="$(find packages -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb"
+          test "$(dpkg-deb -f "$deb" Package)" = "com.551uk.callbarios16"
+          test "$(dpkg-deb -f "$deb" Version)" = "0.0.81.14"
+          test "$(dpkg-deb -f "$deb" Architecture)" = "iphoneos-arm64"
+          dpkg-deb -x "$deb" package-check
+          dylib="package-check/var/jb/Library/MobileSubstrate/DynamicLibraries/CallBarIOS16.dylib"
+          incall="package-check/var/jb/Library/MobileSubstrate/DynamicLibraries/CallBarIOS16InCall.dylib"
+          test -s "$dylib"
+          test -s "$incall"
+          test -s package-check/var/jb/usr/libexec/callbar-loaderd
+          test -f package-check/var/jb/Library/LaunchDaemons/com.551uk.callbar-loaderd.plist
+          lipo "$dylib" -verify_arch arm64 arm64e
+          lipo "$incall" -verify_arch arm64 arm64e
+          shasum -a 256 "$deb"
+
+      - name: Upload verified test DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallBar-0.81.14-Blur-Fix-Test
+          path: src/packages/*.deb
+
+      - name: Publish test DEB without replacing working 0.81.10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          deb="$(find src/packages -maxdepth 1 -name '*.deb' -print -quit)"
+          tag="v0.0.81.14-blur-test"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$deb" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$deb" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --prerelease \
+              --title "CallBar 0.81.14 — Native Telephone Blur Test" \
+              --notes "Test-only build of the CallBar 0.81.14 branch. Keeps SpringBoard's native Phone blur proxy hidden during ordinary unlocked telephone calls after the outgoing state finishes. Not on production main, confirmed-working 0.81.10 DEB remains available; requires on-device testing."
+          fi
+
+      - name: Clean temporary build workflow branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/temporary-test-08114-build"
